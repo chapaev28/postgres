@@ -50,6 +50,11 @@ typedef struct
 	char		tupledata[FLEXIBLE_ARRAY_MEMBER];
 } GISTNodeBufferPage;
 
+typedef struct
+{
+	BlockNumber childblkno;		/* hash key */
+	BlockNumber parentblkno;
+} ParentMapEntry;
 #define BUFFER_PAGE_DATA_OFFSET MAXALIGN(offsetof(GISTNodeBufferPage, tupledata))
 /* Returns free space in node buffer page */
 #define PAGE_FREE_SPACE(nbp) (nbp->freespace)
