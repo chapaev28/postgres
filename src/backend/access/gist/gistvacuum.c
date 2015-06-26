@@ -114,6 +114,7 @@ typedef struct GistBDSItem
 	struct GistBDSItem *next;
 } GistBDSItem;
 
+
 static void
 pushStackIfSplited(Page page, GistBDItem *stack)
 {
@@ -178,6 +179,171 @@ void pushInStack(GistBDSItem* stack, GistBDSItem* item) {
 		stack = item;
 	}
 }
+typedef struct GistDelLinkItem
+{
+	BlockNumber blkno;
+	bool toDelete;
+} GistDelLinkItem;
+
+bool gistGetDeleteLink(HTAB* delLinkMap, BlockNumber child) {
+	GistDelLinkItem *entry;
+	bool		found;
+
+	/* Find node buffer in hash table */
+	entry = (ParentMapEntry *) hash_search(delLinkMap,
+										   (const void *) &child,
+										   HASH_FIND,
+										   &found);
+	if (!found)
+		return true;
+
+	return entry->toDelete;
+}
+void gistMemorizeLinkToDelete(HTAB* delLinkMap, BlockNumber blkno) {
+	GistDelLinkItem *entry;
+	bool		found;
+
+	entry = (ParentMapEntry *) hash_search(delLinkMap,
+										   (const void *) &blkno,
+										   HASH_ENTER,
+										   &found);
+	entry->toDelete = true;
+
+}
+void vacuumPage(Relation rel, BlockNumber blkno, Page page,
+			Buffer buffer, GistNSN lastNSN, GistBDSItem *rescanstack,
+			HTAB* parentMap, HTAB* delLinkMap,
+			IndexBulkDeleteResult* stats, IndexBulkDeleteCallback callback, void* callback_state,
+			bool fromRescan, GistBDSItem* ptr){
+	OffsetNumber i,
+				maxoff;
+	IndexTuple	idxtuple;
+	ItemId		iid;
+	OffsetNumber todelete[MaxOffsetNumber];
+	int			ntodelete = 0;
+	if (GistPageIsLeaf(page))
+	{
+
+		LockBuffer(buffer, GIST_UNLOCK);
+		LockBuffer(buffer, GIST_EXCLUSIVE);
+
+		page = (Page) BufferGetPage(buffer);
+		if(!fromRescan) {
+			if (blkno == GIST_ROOT_BLKNO && !GistPageIsLeaf(page))
+			{
+				UnlockReleaseBuffer(buffer);
+				return;
+			}
+		} else {
+			if (rescanstack->blkno == GIST_ROOT_BLKNO && !GistPageIsLeaf(page))
+			{
+				UnlockReleaseBuffer(buffer);
+				ptr = rescanstack->next;
+				pfree(rescanstack);
+				rescanstack = ptr;
+				return;
+			}
+		}
+		GISTPageOpaque opaque = GistPageGetOpaque(page);
+		if( blkno != GIST_ROOT_BLKNO &&
+				(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
+				opaque->rightlink != InvalidBlockNumber ) {
+			GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
+
+			item->blkno = opaque->rightlink;
+			item->isParent = false;
+			pushInStack(rescanstack, item);
+		}
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+		{
+			iid = PageGetItemId(page, i);
+			idxtuple = (IndexTuple) PageGetItem(page, iid);
+
+			if (callback(&(idxtuple->t_tid), callback_state))
+			{
+				todelete[ntodelete] = i - ntodelete;
+				ntodelete++;
+				stats->tuples_removed += 1;
+			}
+			else
+				stats->num_index_tuples += 1;
+		}
+
+	}
+	else {
+		maxoff = PageGetMaxOffsetNumber(page);
+		GISTPageOpaque opaque = GistPageGetOpaque(page);
+		if( blkno != GIST_ROOT_BLKNO &&
+				(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
+				opaque->rightlink != InvalidBlockNumber ) {
+			GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
+
+			item->blkno = opaque->rightlink;
+			item->isParent = false;
+			pushInStack(rescanstack, item);
+		}
+		for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
+		{
+			iid = PageGetItemId(page, i);
+			idxtuple = (IndexTuple) PageGetItem(page, iid);
+			BlockNumber child;
+			child = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
+			if(!fromRescan) {
+				gistMemorizeParentTab(parentMap, child, blkno);
+			} else {
+				gistMemorizeParentTab(parentMap, child, rescanstack->blkno);
+				bool deleteLink = gistGetDeleteLink(delLinkMap, child);
+				if(deleteLink) {
+					todelete[ntodelete] = i - ntodelete;
+					ntodelete++;
+				}
+			}
+			if (GistTupleIsInvalid(idxtuple))
+				ereport(LOG,
+						(errmsg("index \"%s\" contains an inner tuple marked as invalid",
+								RelationGetRelationName(rel)),
+						 errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."),
+						 errhint("Please REINDEX it.")));
+		}
+	}
+	if (ntodelete)
+	{
+		START_CRIT_SECTION();
+
+		MarkBufferDirty(buffer);
+
+		for (i = 0; i < ntodelete; i++)
+			PageIndexTupleDelete(page, todelete[i]);
+		GistMarkTuplesDeleted(page);
+
+		if (RelationNeedsWAL(rel))
+		{
+			XLogRecPtr	recptr;
+
+			recptr = gistXLogUpdate(rel->rd_node, buffer,
+									todelete, ntodelete,
+									NULL, 0, InvalidBuffer);
+			PageSetLSN(page, recptr);
+		}
+		else
+			PageSetLSN(page, gistGetFakeLSN(rel));
+
+		END_CRIT_SECTION();
+		if (ntodelete == maxoff) {
+			// set delete page and rescan parent page
+			GistPageSetDeleted(page);
+			stats->pages_deleted++;
+			GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
+			item->isParent = true;
+			item->blkno = blkno;
+			pushInStack(rescanstack, item);
+			gistMemorizeLinkToDelete(delLinkMap, blkno);
+		}
+	}
+
+}
 Datum
 gistbulkdelete(PG_FUNCTION_ARGS)
 {
@@ -189,12 +355,14 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	GistBDSItem *rescanstack,
 			   *ptr;
 
+	BlockNumber currentblk;
+	BlockNumber npages,
+				blkno;
+	GistNSN lastNSN;
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
 	stats->estimated_count = false;
 	stats->num_index_tuples = 0;
-	BlockNumber npages,
-				blkno;
 	bool needLock;
 	HTAB	   *parentMap;
 	HASHCTL		hashCtl;
@@ -203,7 +371,17 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	hashCtl.entrysize = sizeof(ParentMapEntry);
 	hashCtl.hcxt = CurrentMemoryContext;
 
-	GistNSN lastNSN;
+
+	HTAB	   *deleteLinkMap;
+	HASHCTL		hashCtlLinkMap;
+
+	hashCtlLinkMap.keysize = sizeof(BlockNumber);
+	hashCtlLinkMap.entrysize = sizeof(bool);
+	hashCtlLinkMap.hcxt = CurrentMemoryContext;
+
+
+
+
 
 	int numberRescanedPage = 0;
 //stopping truncate due to conflicting lock request
@@ -222,15 +400,17 @@ rescan_physical:
 										npages,
 										&hashCtl,
 									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+
+	deleteLinkMap = hash_create("gistvacuum link map",
+										npages,
+										&hashCtl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	lastNSN = XactLastRecEnd;
 	for (; blkno < npages; blkno++)
 	{
 		Buffer		buffer;
 		Page		page;
-		OffsetNumber i,
-					maxoff;
-		IndexTuple	idxtuple;
-		ItemId		iid;
 
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno,
 									RBM_NORMAL, info->strategy);
@@ -238,111 +418,8 @@ rescan_physical:
 		gistcheckpage(rel, buffer);
 		page = (Page) BufferGetPage(buffer);
 
+		vacuumPage(rel, blkno, page, buffer, lastNSN, rescanstack, parentMap, deleteLinkMap, stats, callback, callback_state, false, NULL);
 
-		if (GistPageIsLeaf(page))
-		{
-			OffsetNumber todelete[MaxOffsetNumber];
-			int			ntodelete = 0;
-
-			LockBuffer(buffer, GIST_UNLOCK);
-			LockBuffer(buffer, GIST_EXCLUSIVE);
-
-			page = (Page) BufferGetPage(buffer);
-			if (blkno == GIST_ROOT_BLKNO && !GistPageIsLeaf(page))
-			{
-				UnlockReleaseBuffer(buffer);
-				continue;
-			}
-			GISTPageOpaque opaque = GistPageGetOpaque(page);
-			if( blkno != GIST_ROOT_BLKNO &&
-					(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
-					opaque->rightlink != InvalidBlockNumber ) {
-				GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-
-				item->blkno = opaque->rightlink;
-				item->isParent = false;
-				pushInStack(rescanstack, item);
-			}
-			maxoff = PageGetMaxOffsetNumber(page);
-
-			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-			{
-				iid = PageGetItemId(page, i);
-				idxtuple = (IndexTuple) PageGetItem(page, iid);
-
-				if (callback(&(idxtuple->t_tid), callback_state))
-				{
-					todelete[ntodelete] = i - ntodelete;
-					ntodelete++;
-					stats->tuples_removed += 1;
-				}
-				else
-					stats->num_index_tuples += 1;
-			}
-			if (ntodelete)
-			{
-				START_CRIT_SECTION();
-
-				MarkBufferDirty(buffer);
-
-				for (i = 0; i < ntodelete; i++)
-					PageIndexTupleDelete(page, todelete[i]);
-				GistMarkTuplesDeleted(page);
-
-				if (RelationNeedsWAL(rel))
-				{
-					XLogRecPtr	recptr;
-
-					recptr = gistXLogUpdate(rel->rd_node, buffer,
-											todelete, ntodelete,
-											NULL, 0, InvalidBuffer);
-					PageSetLSN(page, recptr);
-				}
-				else
-					PageSetLSN(page, gistGetFakeLSN(rel));
-
-				END_CRIT_SECTION();
-				if (ntodelete == maxoff) {
-					// set delete page and rescan parent page
-					GistPageSetDeleted(page);
-					stats->pages_deleted++;
-					GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-					item->isParent = true;
-					item->blkno = blkno;
-					pushInStack(rescanstack, item);
-				}
-			}
-
-		}
-		else {
-			maxoff = PageGetMaxOffsetNumber(page);
-			GISTPageOpaque opaque = GistPageGetOpaque(page);
-			if( blkno != GIST_ROOT_BLKNO &&
-					(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
-					opaque->rightlink != InvalidBlockNumber ) {
-				GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-
-				item->blkno = opaque->rightlink;
-				item->isParent = false;
-				pushInStack(rescanstack, item);
-			}
-			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-			{
-				iid = PageGetItemId(page, i);
-				idxtuple = (IndexTuple) PageGetItem(page, iid);
-				BlockNumber child;
-				child = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
-
-				gistMemorizeParentTab(parentMap, child, blkno);
-
-				if (GistTupleIsInvalid(idxtuple))
-					ereport(LOG,
-							(errmsg("index \"%s\" contains an inner tuple marked as invalid",
-									RelationGetRelationName(rel)),
-							 errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."),
-							 errhint("Please REINDEX it.")));
-			}
-		}
 		UnlockReleaseBuffer(buffer);
 		vacuum_delay_point();
 	}
@@ -367,113 +444,7 @@ rescan_stack:
 		if (rescanstack->isParent == true) {
 			rescanstack->blkno = gistGetParentTab(parentMap, rescanstack->blkno);
 		}
-		if (GistPageIsLeaf(page))
-		{
-			OffsetNumber todelete[MaxOffsetNumber];
-			int			ntodelete = 0;
-
-			LockBuffer(buffer, GIST_UNLOCK);
-			LockBuffer(buffer, GIST_EXCLUSIVE);
-
-			page = (Page) BufferGetPage(buffer);
-			if (rescanstack->blkno == GIST_ROOT_BLKNO && !GistPageIsLeaf(page))
-			{
-				UnlockReleaseBuffer(buffer);
-				ptr = rescanstack->next;
-				pfree(rescanstack);
-				rescanstack = ptr;
-				continue;
-			}
-			GISTPageOpaque opaque = GistPageGetOpaque(page);
-			if( rescanstack->blkno != GIST_ROOT_BLKNO &&
-					(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
-					opaque->rightlink != InvalidBlockNumber ) {
-				GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-
-				item->blkno = opaque->rightlink;
-				item->isParent = false;
-				pushInStack(rescanstack, item);
-			}
-			maxoff = PageGetMaxOffsetNumber(page);
-
-			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-			{
-				iid = PageGetItemId(page, i);
-				idxtuple = (IndexTuple) PageGetItem(page, iid);
-
-				if (callback(&(idxtuple->t_tid), callback_state))
-				{
-					todelete[ntodelete] = i - ntodelete;
-					ntodelete++;
-					stats->tuples_removed += 1;
-				}
-				else
-					stats->num_index_tuples += 1;
-			}
-
-			if (ntodelete)
-			{
-				START_CRIT_SECTION();
-
-				MarkBufferDirty(buffer);
-
-				for (i = 0; i < ntodelete; i++)
-					PageIndexTupleDelete(page, todelete[i]);
-				GistMarkTuplesDeleted(page);
-				if (RelationNeedsWAL(rel))
-				{
-					XLogRecPtr	recptr;
-
-					recptr = gistXLogUpdate(rel->rd_node, buffer,
-											todelete, ntodelete,
-											NULL, 0, InvalidBuffer);
-					PageSetLSN(page, recptr);
-				}
-				else
-					PageSetLSN(page, gistGetFakeLSN(rel));
-
-				END_CRIT_SECTION();
-				if (ntodelete == maxoff) {
-					// set delete page and rescan parent page
-					GistPageSetDeleted(page);
-					stats->pages_deleted++;
-					GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-					item->isParent = true;
-					item->blkno = rescanstack->blkno;
-					pushInStack(rescanstack, item);
-				}
-			}
-
-		}
-		else {
-			maxoff = PageGetMaxOffsetNumber(page);
-			GISTPageOpaque opaque = GistPageGetOpaque(page);
-			if( rescanstack->blkno != GIST_ROOT_BLKNO &&
-					(GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) &&
-					opaque->rightlink != InvalidBlockNumber ) {
-				GistBDSItem *item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-
-				item->blkno = opaque->rightlink;
-				item->isParent = false;
-				pushInStack(rescanstack, item);
-			}
-			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
-			{
-				iid = PageGetItemId(page, i);
-				idxtuple = (IndexTuple) PageGetItem(page, iid);
-				BlockNumber child;
-				child = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
-
-				gistMemorizeParentTab(parentMap, child, rescanstack->blkno);
-
-				if (GistTupleIsInvalid(idxtuple))
-					ereport(LOG,
-							(errmsg("index \"%s\" contains an inner tuple marked as invalid",
-									RelationGetRelationName(rel)),
-							 errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."),
-							 errhint("Please REINDEX it.")));
-			}
-		}
+		vacuumPage(rel, blkno, page, buffer, lastNSN, rescanstack, parentMap, deleteLinkMap, stats, callback, callback_state, true, ptr);
 		UnlockReleaseBuffer(buffer);
 
 		ptr = rescanstack->next;
@@ -482,7 +453,6 @@ rescan_stack:
 		vacuum_delay_point();
 	}
 
-	BlockNumber currentblk;
 	hash_destroy(parentMap);
 	if (needLock)
 		LockRelationForExtension(rel, ExclusiveLock);
