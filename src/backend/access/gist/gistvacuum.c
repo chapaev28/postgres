@@ -294,12 +294,13 @@ void vacuumPage(Relation rel, BlockNumber blkno, Page page,
 				gistMemorizeParentTab(parentMap, child, blkno);
 			} else {
 				gistMemorizeParentTab(parentMap, child, rescanstack->blkno);
-				bool deleteLink = gistGetDeleteLink(delLinkMap, child);
-				if(deleteLink) {
-					todelete[ntodelete] = i - ntodelete;
-					ntodelete++;
-				}
 			}
+			bool deleteLink = gistGetDeleteLink(delLinkMap, child);
+			if(deleteLink) {
+				todelete[ntodelete] = i - ntodelete;
+				ntodelete++;
+			}
+
 			if (GistTupleIsInvalid(idxtuple))
 				ereport(LOG,
 						(errmsg("index \"%s\" contains an inner tuple marked as invalid",
