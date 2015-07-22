@@ -195,7 +195,7 @@ static bool gistGetDeleteLink(HTAB* delLinkMap, BlockNumber child) {
 										   HASH_FIND,
 										   &found);
 	if (!found)
-		return true;
+		return false;
 
 	return entry->toDelete;
 }
@@ -521,11 +521,9 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	hashCtl.hcxt = CurrentMemoryContext;
 
 
-
 	hashCtlLinkMap.keysize = sizeof(BlockNumber);
-	hashCtlLinkMap.entrysize = sizeof(bool);
+	hashCtlLinkMap.entrysize = sizeof(GistDelLinkItem);
 	hashCtlLinkMap.hcxt = CurrentMemoryContext;
-
 
 	/* stopping truncate due to conflicting lock request */
 	needLock = !RELATION_IS_LOCAL(rel);
@@ -542,11 +540,11 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	 * estimate memory limit
 	 * if parent map more than maintance_mem_work use old version of vacuum
 	 * */
+
 	memoryneeded = npages * (sizeof(ParentMapEntry) + sizeof(BlockNumber));
 	if(memoryneeded > maintenance_work_mem * 1024) {
 		return gistbulkdeletelogical(info, stats, callback, callback_state);
 	}
-
 	parentMap = hash_create("gistvacuum parent map",
 										npages,
 										&hashCtl,
@@ -598,6 +596,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		vacuum_delay_point();
 	}
 
+	hash_destroy(deleteLinkMap);
 	hash_destroy(parentMap);
 	/*
 	ereport(LOG,
