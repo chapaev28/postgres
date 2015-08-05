@@ -220,6 +220,8 @@ static bool gistGetDeleteLink(HTAB* delLinkMap, BlockNumber blkno) {
 										   (const void *) &blkno,
 										   HASH_FIND,
 										   &found);
+	elog(LOG, "link to delete block %d %i", blkno, found ? entry->toDelete: false);
+
 	if (!found)
 		return false;
 
@@ -234,6 +236,7 @@ static bool gistIsDeletedLink(HTAB* delLinkMap, BlockNumber blkno) {
 										   (const void *) &blkno,
 										   HASH_FIND,
 										   &found);
+	elog(LOG, "link is deleted block %d %i", blkno, entry ? entry->isDeleted: false);
 	return entry ? entry->isDeleted: false;
 }
 static void gistMemorizeLinkToDelete(HTAB* delLinkMap, BlockNumber blkno, bool isDeleted) {
@@ -243,7 +246,11 @@ static void gistMemorizeLinkToDelete(HTAB* delLinkMap, BlockNumber blkno, bool i
 										   (const void *) &blkno,
 										   HASH_ENTER,
 										   &found);
-	//Assert(found == true);
+	/*if (!found)
+		elog(LOG, "could not enter link to delete block %d %i in lookup table", blkno, isDeleted);
+	else
+		elog(LOG, "enter link to delete block %d %i in lookup table", blkno, isDeleted);
+		*/
 	entry->toDelete = true;
 	entry->isDeleted = isDeleted;
 }
@@ -515,14 +522,15 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	deleteLinkMap = hash_create("gistvacuum link map",
 										npages,
 										&hashCtlLinkMap,
-									  HASH_ELEM | HASH_BLOBS  );
+									  HASH_ELEM | HASH_BLOBS  | HASH_CONTEXT);
 
-
+/*
 
 	rightLinkMap = hash_create("gistvacuum rightlink map",
 										npages,
 										&hashCtlRightLinkMap,
 									  HASH_ELEM | HASH_BLOBS );
+									  */
 	xidMap = hash_create("gistvacuum xid map",
 									npages,
 									&hashCtlxidMap,
@@ -646,9 +654,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					tail = rescanstack;
 				}
 
-				ereport(LOG,
-											(errmsg("add to rescan \"%s\" %d", RelationGetRelationName(rel), blkno), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
-
 				gistMemorizeLinkToDelete(deleteLinkMap, blkno, false);
 			} else {
 				START_CRIT_SECTION();
@@ -691,6 +696,8 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		BlockNumber child;
 		Buffer childBuffer;
 		GistBDSItem *item;
+		bool isNew;
+		bool isDeleted;
 
 
 		blkno = rescanstack->blkno;
@@ -698,9 +705,12 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			blkno = gistGetParentTab(parentMap, rescanstack->blkno);
 		}
 
-		bool isDeleted = gistIsDeletedLink(deleteLinkMap, blkno);
+		isDeleted = gistIsDeletedLink(deleteLinkMap, blkno);
 
 		if(isDeleted == true) {
+
+		//	elog(LOG, "skip page %d", blkno);
+
 			ptr = rescanstack->next;
 			pfree(rescanstack);
 			rescanstack = ptr;
@@ -708,7 +718,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			vacuum_delay_point();
 			continue;
 		}
-
+		//elog(LOG, "process page %d", blkno);
 
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno,
 				RBM_NORMAL, info->strategy);
@@ -753,7 +763,21 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			if (blkno != GIST_ROOT_BLKNO
 					&& (GistFollowRight(page) || lastNSN < GistPageGetNSN(page))
 					&& opaque->rightlink != InvalidBlockNumber) {
+				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
+				item->isParent = false;
+				item->blkno = opaque->rightlink;
+				item->next = NULL;
+
+				if (rescanstack != NULL) {
+					//item->next = rescanstack->next;
+					//rescanstack->next = item;
+					tail->next = item;
+					tail = item;
+				} else {
+					rescanstack = item;
+					tail = rescanstack;
+				}
 			}
 
 			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
@@ -781,7 +805,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 						int ntodeletechild = 0;
 						OffsetNumber j, maxoffchild;
 						Page childpage;
-						bool isNew;
+						bool childIsNew;
 
 
 						childBuffer = ReadBufferExtended(rel, MAIN_FORKNUM, child,
@@ -790,7 +814,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 						LockBuffer(childBuffer, GIST_EXCLUSIVE);
 
 						childpage = (Page) BufferGetPage(childBuffer);
-						isNew = PageIsNew(childpage);
+						childIsNew = PageIsNew(childpage) || PageIsEmpty(childpage);
 
 						if(GistPageIsLeaf(childpage)) {
 							// also check right links
@@ -802,9 +826,13 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 								if (callback(&(idxtuplechild->t_tid), callback_state)) {
 									todeletechild[ntodeletechild] = j - ntodeletechild;
 									ntodeletechild++;
+
+									gistRemoveLinkToDelete(deleteLinkMap, child);
+									gistMemorizeLinkToDelete(deleteLinkMap, child, true);
+
 								}
 							}
-							if(ntodeletechild || isNew) {
+							if(ntodeletechild || childIsNew) {
 								START_CRIT_SECTION();
 
 								MarkBufferDirty(childBuffer);
@@ -825,7 +853,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 								END_CRIT_SECTION();
 
-								if(ntodeletechild == maxoffchild || isNew) {
+								if((ntodeletechild == maxoffchild) || childIsNew) {
 
 									GistPageSetDeleted(childpage);
 									stats->pages_deleted++;
@@ -838,17 +866,18 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 							todelete[ntodelete] = i - ntodelete;
 							ntodelete++;
 						}
+						UnlockReleaseBuffer(childBuffer);
 					} else {
 						// rescan later
 						/*ereport(LOG,
 								(errmsg("index \"%s\" dont precedes", RelationGetRelationName(rel)), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
 						*/
 					}
-					UnlockReleaseBuffer(childBuffer);
 				}
 			}
 		}
-		if (ntodelete) {
+		isNew = PageIsNew(page) || PageIsEmpty(page);
+		if (ntodelete || isNew) {
 			START_CRIT_SECTION();
 
 			MarkBufferDirty(buffer);
@@ -869,13 +898,13 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 			END_CRIT_SECTION();
 
-			if (maxoff == ntodelete) {
+			if ((maxoff == ntodelete) || isNew) {
 				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
 				if (blkno != GIST_ROOT_BLKNO) {
 
-					item->isParent = true;
-					item->blkno = blkno;
+					item->isParent = false;
+					item->blkno = gistGetParentTab(parentMap, blkno);
 					item->next = NULL;
 
 					//pushInStack(rescanstack, item);
@@ -894,9 +923,16 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					/*
 					 * its page is scaned. dont scan it later
 					 * */
-					//gistRemoveLinkToDelete(deleteLinkMap, blkno);
-					//gistMemorizeLinkToDelete(deleteLinkMap, blkno, true);
 
+					/* link to blkno to delete and this page is processed*/
+					gistRemoveLinkToDelete(deleteLinkMap, blkno);
+					gistMemorizeLinkToDelete(deleteLinkMap, blkno, true);
+
+					GistPageGetOpaque(page)->flags |= F_LEAF;
+/*
+					ereport(LOG,
+																(errmsg("add to rescan \"%s\" %d", RelationGetRelationName(rel), blkno), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
+*/
 					//gistMemorizeLinkToDelete(deleteLinkMap, blkno, false);
 					//GistPageGetOpaque(page)->flags |= F_LEAF;
 					/* get parent remove and add link to delete false!!!!!!!!! */
