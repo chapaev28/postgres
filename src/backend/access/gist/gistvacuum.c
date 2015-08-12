@@ -865,6 +865,9 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 							// child is inner page
 							todelete[ntodelete] = i - ntodelete;
 							ntodelete++;
+							GistPageSetDeleted(childpage);
+							stats->pages_deleted++;
+
 						}
 						UnlockReleaseBuffer(childBuffer);
 					} else {
@@ -928,7 +931,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					gistRemoveLinkToDelete(deleteLinkMap, blkno);
 					gistMemorizeLinkToDelete(deleteLinkMap, blkno, true);
 
-					GistPageGetOpaque(page)->flags |= F_LEAF;
+					// GistPageGetOpaque(page)->flags |= F_LEAF;
 /*
 					ereport(LOG,
 																(errmsg("add to rescan \"%s\" %d", RelationGetRelationName(rel), blkno), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
@@ -938,7 +941,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					/* get parent remove and add link to delete false!!!!!!!!! */
 
 				} else {
-					GistPageGetOpaque(page)->flags |= F_LEAF;
+					 GistPageGetOpaque(page)->flags |= F_LEAF;
 				}
 			}
 		}
