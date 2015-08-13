@@ -116,6 +116,13 @@ typedef struct GistBDSItem
 	struct GistBDSItem *next;
 } GistBDSItem;
 
+typedef struct GistBlockInfo {
+	BlockNumber blkno;
+	BlockNumber parent;
+	BlockNumber leftblock;		/* block that has rightlink on blkno */
+	bool toDelete;				/* is need delete this block? */
+	bool isDeleted;				/* this block was processed 	*/
+} GistBlockInfo;
 
 static void
 pushStackIfSplited(Page page, GistBDItem *stack)
@@ -139,33 +146,33 @@ pushStackIfSplited(Page page, GistBDItem *stack)
 static void
 gistMemorizeParentTab(HTAB * map, BlockNumber child, BlockNumber parent)
 {
-	ParentMapEntry *entry;
+	GistBlockInfo *entry;
 	bool		found;
 
-	entry = (ParentMapEntry *) hash_search(map,
+	entry = (GistBlockInfo *) hash_search(map,
 										   (const void *) &child,
 										   HASH_ENTER,
 										   &found);
 	//if (!found)
 	//	elog(ERROR, "could not enter parent of block %d in lookup table", child);
 
-	entry->parentblkno = parent;
+	entry->parent = parent;
 }
 static BlockNumber
 gistGetParentTab(HTAB * map, BlockNumber child)
 {
-	ParentMapEntry *entry;
+	GistBlockInfo *entry;
 	bool		found;
 
 	/* Find node buffer in hash table */
-	entry = (ParentMapEntry *) hash_search(map,
+	entry = (GistBlockInfo *) hash_search(map,
 										   (const void *) &child,
 										   HASH_FIND,
 										   &found);
 	if (!found)
 		elog(ERROR, "could not find parent of block %d in lookup table", child);
 
-	return entry->parentblkno;
+	return entry->parent;
 }
 /*
 static BlockNumber gistGetLeftLink(HTAB * map, BlockNumber right, bool* found)
@@ -198,51 +205,40 @@ static void pushInStack(GistBDSItem* stack, GistBDSItem* item) {
 	}
 }
 */
-typedef struct GistDelLinkItem
-{
-	BlockNumber blkno;
-	bool toDelete;
-	bool isDeleted;
-} GistDelLinkItem;
 
-typedef struct GistBlockXidItem
-{
-	BlockNumber blkno;
-	TransactionId id;
-} GistBlockXidItem;
 
-static bool gistGetDeleteLink(HTAB* delLinkMap, BlockNumber blkno) {
-	GistDelLinkItem *entry;
+static bool gistGetDeleteLink(HTAB* map, BlockNumber blkno) {
+	GistBlockInfo *entry;
 	bool		found;
 
 	/* Find node buffer in hash table */
-	entry = (GistDelLinkItem *) hash_search(delLinkMap,
+	entry = (GistBlockInfo *) hash_search(map,
 										   (const void *) &blkno,
 										   HASH_FIND,
 										   &found);
-	elog(LOG, "link to delete block %d %i", blkno, found ? entry->toDelete: false);
+	//elog(LOG, "link to delete block %d %i", blkno, found ? entry->toDelete: false);
 
 	if (!found)
 		return false;
 
 	return entry->toDelete;
 }
-static bool gistIsDeletedLink(HTAB* delLinkMap, BlockNumber blkno) {
-	GistDelLinkItem *entry;
+static bool gistIsDeletedLink(HTAB* map, BlockNumber blkno) {
+	GistBlockInfo *entry;
 	bool		found;
 
 	/* Find node buffer in hash table */
-	entry = (GistDelLinkItem *) hash_search(delLinkMap,
+	entry = (GistBlockInfo *) hash_search(map,
 										   (const void *) &blkno,
 										   HASH_FIND,
-										   &found);
-	elog(LOG, "link is deleted block %d %i", blkno, entry ? entry->isDeleted: false);
+										   &map);
+	//elog(LOG, "link is deleted block %d %i", blkno, entry ? entry->isDeleted: false);
 	return entry ? entry->isDeleted: false;
 }
-static void gistMemorizeLinkToDelete(HTAB* delLinkMap, BlockNumber blkno, bool isDeleted) {
-	GistDelLinkItem *entry;
+static void gistMemorizeLinkToDelete(HTAB* map, BlockNumber blkno, bool isDeleted) {
+	GistBlockInfo *entry;
 	bool		found;
-	entry = (GistDelLinkItem *) hash_search(delLinkMap,
+	entry = (GistBlockInfo *) hash_search(map,
 										   (const void *) &blkno,
 										   HASH_ENTER,
 										   &found);
@@ -254,39 +250,12 @@ static void gistMemorizeLinkToDelete(HTAB* delLinkMap, BlockNumber blkno, bool i
 	entry->toDelete = true;
 	entry->isDeleted = isDeleted;
 }
-static void gistRemoveLinkToDelete(HTAB* delLinkMap, BlockNumber blkno) {
-	GistDelLinkItem *entry;
+static void gistRemoveLinkToDelete(HTAB* map, BlockNumber blkno) {
+	GistBlockInfo *entry;
 	bool		found;
 
-	hash_search(delLinkMap, &blkno,
+	hash_search(map, &blkno,
 				HASH_REMOVE, &found);
-}
-static bool gistGetXidBlock(HTAB* xmap, BlockNumber blkno) {
-	GistBlockXidItem *entry;
-	bool		found;
-
-	/* Find node buffer in hash table */
-	entry = (GistBlockXidItem *) hash_search(xmap,
-										   (const void *) &blkno,
-										   HASH_FIND,
-										   &found);
-	if (!found)
-		elog(ERROR, "could not find xid of block %d in lookup table", blkno);
-
-	return entry->id;
-}
-static void gistMemorizeXidBlock(HTAB* xmap, BlockNumber blkno, TransactionId id) {
-	GistBlockXidItem *entry;
-	bool		found;
-
-	entry = (GistBlockXidItem *) hash_search(xmap,
-										   (const void *) &blkno,
-										   HASH_ENTER,
-										   &found);
-
-
-	entry->id = id;
-
 }
 /*
 
@@ -451,19 +420,16 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	GistNSN lastNSN;
 
 	bool needLock;
-	HTAB	   *parentMap;
+	HTAB	   *infomap;
 	HASHCTL		hashCtl;
 
+	/*
 	HTAB	   *deleteLinkMap;
 	HASHCTL		hashCtlLinkMap;
 
 	HTAB	   *rightLinkMap;
 	HASHCTL		hashCtlRightLinkMap;
-
-	HTAB	   *xidMap;
-	HASHCTL		hashCtlxidMap;
-
-
+	*/
 
 	if (stats == NULL)
 		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
@@ -473,10 +439,10 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 
 	hashCtl.keysize = sizeof(BlockNumber);
-	hashCtl.entrysize = sizeof(ParentMapEntry);
+	hashCtl.entrysize = sizeof(GistBlockInfo);
 	hashCtl.hcxt = CurrentMemoryContext;
 
-
+	/*
 	hashCtlLinkMap.keysize = sizeof(BlockNumber);
 	hashCtlLinkMap.entrysize = sizeof(GistDelLinkItem);
 	hashCtlLinkMap.hcxt = CurrentMemoryContext;
@@ -485,12 +451,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	hashCtlRightLinkMap.keysize = sizeof(BlockNumber);
 	hashCtlRightLinkMap.entrysize = sizeof(ParentMapEntry);
 	hashCtlRightLinkMap.hcxt = CurrentMemoryContext;
-
-	hashCtlxidMap.keysize = sizeof(BlockNumber);
-	hashCtlxidMap.entrysize = sizeof(GistBlockXidItem);
-	hashCtlxidMap.hcxt = CurrentMemoryContext;
-
-
+	*/
 
 	/* stopping truncate due to conflicting lock request */
 	needLock = !RELATION_IS_LOCAL(rel);
@@ -514,36 +475,25 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	}
 
 
-	parentMap = hash_create("gistvacuum parent map",
+	infomap = hash_create("gistvacuum info map",
 										npages,
 										&hashCtl,
 									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT );
-
+/*
 	deleteLinkMap = hash_create("gistvacuum link map",
 										npages,
 										&hashCtlLinkMap,
 									  HASH_ELEM | HASH_BLOBS  | HASH_CONTEXT);
 
-/*
+
 
 	rightLinkMap = hash_create("gistvacuum rightlink map",
 										npages,
 										&hashCtlRightLinkMap,
 									  HASH_ELEM | HASH_BLOBS );
 									  */
-	xidMap = hash_create("gistvacuum xid map",
-									npages,
-									&hashCtlxidMap,
-									HASH_ELEM | HASH_BLOBS );
-
-
 
 	lastNSN = XactLastRecEnd;
-	/*
-	rescanstack = (GistBDSItem *) palloc(sizeof(GistBDSItem));
-	rescanstack->isParent = false;
-	rescanstack->blkno = blkno;
-	rescanstack->next = NULL; */
 
 	for (; blkno < npages; blkno++) {
 		Buffer buffer;
@@ -567,10 +517,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		isNew = PageIsNew(page);
 
 		if (GistPageIsLeaf(page)) {
-			// push all information to maps
-			TransactionId id = GetActiveSnapshot()->xmin;
-			gistMemorizeXidBlock(xidMap, blkno, id);
-
 			// check page to delete
 			// scan page
 
@@ -620,15 +566,13 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 				}
 
 			}
-			TransactionId id = GetActiveSnapshot()->xmin;
-			gistMemorizeXidBlock(xidMap, blkno, id);
 
 			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
 				iid = PageGetItemId(page, i);
 				idxtuple = (IndexTuple) PageGetItem(page, iid);
 				child = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
 
-				gistMemorizeParentTab(parentMap, child, blkno);
+				gistMemorizeParentTab(infomap, child, blkno);
 
 				if (GistTupleIsInvalid(idxtuple))
 					ereport(LOG,
@@ -654,7 +598,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					tail = rescanstack;
 				}
 
-				gistMemorizeLinkToDelete(deleteLinkMap, blkno, false);
+				gistMemorizeLinkToDelete(infomap, blkno, false);
 			} else {
 				START_CRIT_SECTION();
 
@@ -678,8 +622,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			}
 		}
 
-//		vacuumPage(info, rel, blkno, page, buffer, lastNSN, rescanstack, parentMap, deleteLinkMap, rightLinkMap, xidMap, stats, callback, callback_state, false);
-
 		UnlockReleaseBuffer(buffer);
 		vacuum_delay_point();
 	}
@@ -702,10 +644,10 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 		blkno = rescanstack->blkno;
 		if (rescanstack->isParent == true) {
-			blkno = gistGetParentTab(parentMap, rescanstack->blkno);
+			blkno = gistGetParentTab(infomap, rescanstack->blkno);
 		}
 
-		isDeleted = gistIsDeletedLink(deleteLinkMap, blkno);
+		isDeleted = gistIsDeletedLink(infomap, blkno);
 
 		if(isDeleted == true) {
 
@@ -718,7 +660,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			vacuum_delay_point();
 			continue;
 		}
-		//elog(LOG, "process page %d", blkno);
 
 		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, blkno,
 				RBM_NORMAL, info->strategy);
@@ -727,13 +668,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		gistcheckpage(rel, buffer);
 		page = (Page) BufferGetPage(buffer);
 
-//		vacuumPage(info, rel, blkno, page, buffer, lastNSN, rescanstack, parentMap, deleteLinkMap, rightLinkMap, xidMap, stats, callback, callback_state, true);
-
 		if (GistPageIsLeaf(page)) {
-			// push all information to maps
-			TransactionId id = GetActiveSnapshot()->xmin;
-			gistMemorizeXidBlock(xidMap, blkno, id);
-
 			// check page to delete
 			// scan page
 
@@ -754,7 +689,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			/*
 			 * delete leafs entry
 			 * */
-			TransactionId id;
 			LockBuffer(buffer, GIST_UNLOCK);
 			LockBuffer(buffer, GIST_EXCLUSIVE);
 
@@ -787,95 +721,117 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 				child = ItemPointerGetBlockNumber(&(idxtuple->t_tid));
 
-				delete = gistGetDeleteLink(deleteLinkMap, child);
+				delete = gistGetDeleteLink(infomap, child);
 				/*
 				 * leaf needed to delete????
 				 * */
 				if (delete) {
-				/*	ereport(LOG,
-							(errmsg("delete it  \"%s\" %d", RelationGetRelationName(rel), child), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
-				*/
-					id = gistGetXidBlock(xidMap, child);
-					if (TransactionIdPrecedes(id, RecentGlobalDataXmin)) {
-						// all data is visible is not held
+					/*	ereport(LOG,
+					 (errmsg("delete it  \"%s\" %d", RelationGetRelationName(rel), child), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
+					 */
+					// all data is visible is not held
+					IndexTuple idxtuplechild;
+					ItemId iidchild;
+					OffsetNumber todeletechild[MaxOffsetNumber];
+					int ntodeletechild = 0;
+					OffsetNumber j, maxoffchild;
+					Page childpage;
+					bool childIsNew;
+					GISTPageOpaque childopaque;
 
-						IndexTuple idxtuplechild;
-						ItemId iidchild;
-						OffsetNumber todeletechild[MaxOffsetNumber];
-						int ntodeletechild = 0;
-						OffsetNumber j, maxoffchild;
-						Page childpage;
-						bool childIsNew;
+					childBuffer = ReadBufferExtended(rel, MAIN_FORKNUM, child,
+							RBM_NORMAL, info->strategy);
 
+					LockBuffer(childBuffer, GIST_EXCLUSIVE);
 
-						childBuffer = ReadBufferExtended(rel, MAIN_FORKNUM, child,
-								RBM_NORMAL, info->strategy);
+					childpage = (Page) BufferGetPage(childBuffer);
+					childIsNew = PageIsNew(childpage) || PageIsEmpty(childpage);
 
-						LockBuffer(childBuffer, GIST_EXCLUSIVE);
+					if (GistPageIsLeaf(childpage)) {
+						// also check right links
+						maxoffchild = PageGetMaxOffsetNumber(childpage);
+						for (j = FirstOffsetNumber; j <= maxoffchild; j = OffsetNumberNext(j)) {
+							iidchild = PageGetItemId(childpage, j);
+							idxtuplechild = (IndexTuple) PageGetItem(childpage,
+									iidchild);
 
-						childpage = (Page) BufferGetPage(childBuffer);
-						childIsNew = PageIsNew(childpage) || PageIsEmpty(childpage);
+							if (callback(&(idxtuplechild->t_tid), callback_state)) {
+								todeletechild[ntodeletechild] = j- ntodeletechild;
+								ntodeletechild++;
 
-						if(GistPageIsLeaf(childpage)) {
-							// also check right links
-							maxoffchild = PageGetMaxOffsetNumber(childpage);
-							for (j = FirstOffsetNumber; j <= maxoffchild; j = OffsetNumberNext(j)) {
-								iidchild = PageGetItemId(childpage, j);
-								idxtuplechild = (IndexTuple) PageGetItem(childpage, iidchild);
+								//gistRemoveLinkToDelete(infomap, child);
+								gistMemorizeLinkToDelete(infomap, child, true);
 
-								if (callback(&(idxtuplechild->t_tid), callback_state)) {
-									todeletechild[ntodeletechild] = j - ntodeletechild;
-									ntodeletechild++;
-
-									gistRemoveLinkToDelete(deleteLinkMap, child);
-									gistMemorizeLinkToDelete(deleteLinkMap, child, true);
-
-								}
 							}
-							if(ntodeletechild || childIsNew) {
-								START_CRIT_SECTION();
-
-								MarkBufferDirty(childBuffer);
-
-								for (j = 0; j < ntodeletechild; j++)
-									PageIndexTupleDelete(childpage, todeletechild[j]);
-								GistMarkTuplesDeleted(childpage);
-
-								if (RelationNeedsWAL(rel)) {
-									XLogRecPtr recptr;
-
-									recptr = gistXLogUpdate(rel->rd_node, childBuffer, todeletechild,
-											ntodeletechild,
-											NULL, 0, InvalidBuffer);
-									PageSetLSN(childpage, recptr);
-								} else
-									PageSetLSN(childpage, gistGetFakeLSN(rel));
-
-								END_CRIT_SECTION();
-
-								if((ntodeletechild == maxoffchild) || childIsNew) {
-
-									GistPageSetDeleted(childpage);
-									stats->pages_deleted++;
-									todelete[ntodelete] = i - ntodelete;
-									ntodelete++;
-								}
-							}
-						} else {
-							// child is inner page
-							todelete[ntodelete] = i - ntodelete;
-							ntodelete++;
-							GistPageSetDeleted(childpage);
-							stats->pages_deleted++;
-
 						}
-						UnlockReleaseBuffer(childBuffer);
+						if (ntodeletechild || childIsNew) {
+							START_CRIT_SECTION();
+
+							MarkBufferDirty(childBuffer);
+
+							for (j = 0; j < ntodeletechild; j++)
+								PageIndexTupleDelete(childpage,
+										todeletechild[j]);
+							GistMarkTuplesDeleted(childpage);
+
+							if (RelationNeedsWAL(rel)) {
+								XLogRecPtr recptr;
+
+								recptr = gistXLogUpdate(rel->rd_node,
+										childBuffer, todeletechild,
+										ntodeletechild,
+										NULL, 0, InvalidBuffer);
+								PageSetLSN(childpage, recptr);
+							} else
+								PageSetLSN(childpage, gistGetFakeLSN(rel));
+
+							END_CRIT_SECTION();
+
+							if ((ntodeletechild == maxoffchild) || childIsNew) {
+								/*
+								 * save transaction of set deleted!!!!
+								 * */
+
+								PageHeader p = (PageHeader) childpage;
+								p->pd_prune_xid = GetCurrentTransactionId();
+								elog(LOG, "trans id %d", p->pd_prune_xid);
+								/*
+								 *
+								 * if there is right link on this page but not rightlink from this page. remove rightlink from left page.
+								 * if there is right link on this page and there is a right link . right link of left page must be rightlink to rightlink of this page.
+								 * */
+								/*
+								childopaque = GistPageGetOpaque(childpage);
+								if(childopaque->rightlink != InvalidBlockNumber) {
+
+								} */
+								/*
+								 childopaque = GistPageGetOpaque(childpage);
+								 // binary format check
+								 if(PageGetSpecialSize(childpage) >= sizeof(GISTPageOpaque)) {
+								 // all is ok.
+								 } else {
+								 // move opaque
+								 } */
+
+								GistPageSetDeleted(childpage);
+								stats->pages_deleted++;
+								todelete[ntodelete] = i - ntodelete;
+								ntodelete++;
+							}
+						}
 					} else {
-						// rescan later
-						/*ereport(LOG,
-								(errmsg("index \"%s\" dont precedes", RelationGetRelationName(rel)), errdetail("This is caused by an incomplete page split at crash recovery before upgrading to PostgreSQL 9.1."), errhint("Please REINDEX it.")));
-						*/
+						PageHeader p = (PageHeader) childpage;
+						// child is inner page
+						todelete[ntodelete] = i - ntodelete;
+						ntodelete++;
+						p->pd_prune_xid = GetCurrentTransactionId();
+						elog(LOG, "trans id %d", p->pd_prune_xid);
+						GistPageSetDeleted(childpage);
+						stats->pages_deleted++;
+
 					}
+					UnlockReleaseBuffer(childBuffer);
 				}
 			}
 		}
@@ -907,7 +863,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 				if (blkno != GIST_ROOT_BLKNO) {
 
 					item->isParent = false;
-					item->blkno = gistGetParentTab(parentMap, blkno);
+					item->blkno = gistGetParentTab(infomap, blkno);
 					item->next = NULL;
 
 					//pushInStack(rescanstack, item);
@@ -928,8 +884,9 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					 * */
 
 					/* link to blkno to delete and this page is processed*/
-					gistRemoveLinkToDelete(deleteLinkMap, blkno);
-					gistMemorizeLinkToDelete(deleteLinkMap, blkno, true);
+
+					//gistRemoveLinkToDelete(deleteLinkMap, blkno);
+					gistMemorizeLinkToDelete(infomap, blkno, true);
 
 					// GistPageGetOpaque(page)->flags |= F_LEAF;
 /*
@@ -956,9 +913,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 	}
 
-	hash_destroy(xidMap);
-	hash_destroy(rightLinkMap);
-	hash_destroy(deleteLinkMap);
-	hash_destroy(parentMap);
+	hash_destroy(infomap);
 	PG_RETURN_POINTER(stats);
 }
