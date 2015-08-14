@@ -786,8 +786,6 @@ gistNewBuffer(Relation r)
 			gistcheckpage(r, buffer);
 
 			if (GistPageIsDeleted(page) && TransactionIdPrecedes(p->pd_prune_xid, RecentGlobalDataXmin)) {
-
-				elog(LOG, "gist new trans id %d < %d", p->pd_prune_xid, RecentGlobalDataXmin);
 				return buffer;	/* OK to use */
 			}
 			LockBuffer(buffer, GIST_UNLOCK);
