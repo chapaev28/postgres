@@ -403,7 +403,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	BlockNumber npages,
 				blkno;
 
-	GistNSN lastNSN;
+	//GistNSN lastNSN;
 
 	bool needLock;
 	HTAB	   *infomap;
@@ -436,7 +436,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 	 * if parent map more than maintance_mem_work use old version of vacuum
 	 * */
 
-	memoryneeded = npages * (sizeof(ParentMapEntry) + sizeof(BlockNumber));
+	memoryneeded = npages * (sizeof(GistBlockInfo));
 	if(memoryneeded > maintenance_work_mem * 1024) {
 		return gistbulkdeletelogical(info, stats, callback, callback_state);
 	}
@@ -447,7 +447,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 										&hashCtl,
 									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT );
 
-	lastNSN = XactLastRecEnd;
+	//lastNSN = XactLastRecEnd;
 	for (; blkno < npages; blkno++) {
 		Buffer buffer;
 		Page page;
@@ -468,6 +468,9 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		page = (Page) BufferGetPage(buffer);
 
 		isNew = PageIsNew(page);
+		opaque = GistPageGetOpaque(page);
+
+		gistMemorizeLeftLink(infomap, blkno, opaque->rightlink);
 
 		if (GistPageIsLeaf(page)) {
 			// check page to delete
@@ -493,18 +496,12 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			 * first scan
 			 * */
 
-			/*
-			 * blkno dont has leftlink
-			 * */
-			gistMemorizeLeftLink(infomap, blkno, InvalidBlockNumber);
-
 			maxoff = PageGetMaxOffsetNumber(page);
-			opaque = GistPageGetOpaque(page);
 			if (blkno != GIST_ROOT_BLKNO
-					&& (GistFollowRight(page) || lastNSN < GistPageGetNSN(page))
+					/*&& (GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) */
 					&& opaque->rightlink != InvalidBlockNumber) {
 				/*
-				 * loop to rightlink . build left link map. add to rescan later.
+				 * build left link map. add to rescan later.
 				 * */
 				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
@@ -512,7 +509,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 				item->blkno = opaque->rightlink;
 				item->next = NULL;
 
-				gistMemorizeLeftLink(infomap, opaque->rightlink , blkno);
 				if (rescanstack != NULL) {
 					tail->next = item;
 					tail = item;
@@ -520,7 +516,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					rescanstack = item;
 					tail = rescanstack;
 				}
-
 			}
 			for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i)) {
 				iid = PageGetItemId(page, i);
@@ -536,7 +531,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 		}
 		if (ntodelete || isNew) {
-			if (maxoff == ntodelete || isNew) {
+			if ((maxoff == ntodelete) || isNew) {
 				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
 				item->isParent = true;
@@ -646,7 +641,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 			maxoff = PageGetMaxOffsetNumber(page);
 			opaque = GistPageGetOpaque(page);
 			if (blkno != GIST_ROOT_BLKNO
-					&& (GistFollowRight(page) || lastNSN < GistPageGetNSN(page))
+				/*	&& (GistFollowRight(page) || lastNSN < GistPageGetNSN(page)) */
 					&& opaque->rightlink != InvalidBlockNumber) {
 				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
@@ -694,7 +689,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					childIsNew = PageIsNew(childpage) || PageIsEmpty(childpage);
 
 					if (GistPageIsLeaf(childpage)) {
-						// also check right links
 						maxoffchild = PageGetMaxOffsetNumber(childpage);
 						for (j = FirstOffsetNumber; j <= maxoffchild; j = OffsetNumberNext(j)) {
 							iidchild = PageGetItemId(childpage, j);
