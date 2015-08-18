@@ -196,14 +196,6 @@ static void gistMemorizeLeftLink(HTAB * map, BlockNumber right, BlockNumber left
 	entry->leftblock = left;
 }
 
-/*
- * Bulk deletion of all index entries pointing to a set of heap tuples and
- * check invalid tuples left after upgrade.
- * The set of target tuples is specified via a callback routine that tells
- * whether any given heap tuple (identified by ItemPointer) is being deleted.
- *
- * Result: a palloc'd struct containing statistical info for VACUUM displays.
- */
 
 static bool gistGetDeleteLink(HTAB* map, BlockNumber blkno) {
 	GistBlockInfo *entry;
@@ -242,16 +234,15 @@ static void gistMemorizeLinkToDelete(HTAB* map, BlockNumber blkno, bool isDelete
 	entry->toDelete = true;
 	entry->isDeleted = isDeleted;
 }
+
 /*
-
-static void vacuumPage(IndexVacuumInfo * info, Relation rel, BlockNumber blkno, Page page,
-			Buffer buffer, GistNSN lastNSN, GistBDSItem* rescanstack,
-			HTAB* parentMap, HTAB* delLinkMap, HTAB* rightLinkMap,
-			HTAB* xmap,
-			IndexBulkDeleteResult* stats, IndexBulkDeleteCallback callback, void* callback_state,
-			bool fromRescan) {
-}*/
-
+ * Bulk deletion of all index entries pointing to a set of heap tuples and
+ * check invalid tuples left after upgrade.
+ * The set of target tuples is specified via a callback routine that tells
+ * whether any given heap tuple (identified by ItemPointer) is being deleted.
+ *
+ * Result: a palloc'd struct containing statistical info for VACUUM displays.
+ */
 static Datum
 gistbulkdeletelogical(IndexVacuumInfo * info, IndexBulkDeleteResult * stats, IndexBulkDeleteCallback callback, void* callback_state)
 {
@@ -386,68 +377,12 @@ gistbulkdeletelogical(IndexVacuumInfo * info, IndexBulkDeleteResult * stats, Ind
 	PG_RETURN_POINTER(stats);
 }
 
-Datum
-gistbulkdelete(PG_FUNCTION_ARGS)
+static void gistphysicalvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * stats,
+		IndexBulkDeleteCallback callback, void* callback_state,
+		BlockNumber npages, HTAB* infomap,
+		GistBDSItem* rescanstack, GistBDSItem* tail)
 {
-	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
-	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
-	IndexBulkDeleteCallback callback = (IndexBulkDeleteCallback) PG_GETARG_POINTER(2);
-	void	   *callback_state = (void *) PG_GETARG_POINTER(3);
-	Relation	rel = info->index;
-	GistBDSItem *rescanstack = NULL,
-			   *ptr = NULL,
-			   *tail = NULL;
-
-	int memoryneeded = 0;
-
-	BlockNumber npages,
-				blkno;
-
-	//GistNSN lastNSN;
-
-	bool needLock;
-	HTAB	   *infomap;
-	HASHCTL		hashCtl;
-
-
-	if (stats == NULL)
-		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
-	stats->estimated_count = false;
-	stats->num_index_tuples = 0;
-
-
-
-	hashCtl.keysize = sizeof(BlockNumber);
-	hashCtl.entrysize = sizeof(GistBlockInfo);
-	hashCtl.hcxt = CurrentMemoryContext;
-
-	needLock = !RELATION_IS_LOCAL(rel);
-	blkno = GIST_ROOT_BLKNO;
-
-	/* try to find deleted pages */
-	if (needLock)
-		LockRelationForExtension(rel, ExclusiveLock);
-	npages = RelationGetNumberOfBlocks(rel);
-	if (needLock)
-		UnlockRelationForExtension(rel, ExclusiveLock);
-
-	/*
-	 * estimate memory limit
-	 * if parent map more than maintance_mem_work use old version of vacuum
-	 * */
-
-	memoryneeded = npages * (sizeof(GistBlockInfo));
-	if(memoryneeded > maintenance_work_mem * 1024) {
-		return gistbulkdeletelogical(info, stats, callback, callback_state);
-	}
-
-
-	infomap = hash_create("gistvacuum info map",
-										npages,
-										&hashCtl,
-									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT );
-
-	//lastNSN = XactLastRecEnd;
+	BlockNumber blkno = GIST_ROOT_BLKNO;
 	for (; blkno < npages; blkno++) {
 		Buffer buffer;
 		Page page;
@@ -467,14 +402,12 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		gistcheckpage(rel, buffer);
 		page = (Page) BufferGetPage(buffer);
 
-		isNew = PageIsNew(page);
+		isNew = PageIsNew(page) || PageIsEmpty(page);
 		opaque = GistPageGetOpaque(page);
 
 		gistMemorizeLeftLink(infomap, blkno, opaque->rightlink);
 
 		if (GistPageIsLeaf(page)) {
-			// check page to delete
-			// scan page
 
 			LockBuffer(buffer, GIST_UNLOCK);
 			LockBuffer(buffer, GIST_EXCLUSIVE);
@@ -532,8 +465,8 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		}
 		if (ntodelete || isNew) {
 			if ((maxoff == ntodelete) || isNew) {
-				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 
+				item = (GistBDSItem *) palloc(sizeof(GistBDSItem));
 				item->isParent = true;
 				item->blkno = blkno;
 				item->next = NULL;
@@ -573,7 +506,13 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		UnlockReleaseBuffer(buffer);
 		vacuum_delay_point();
 	}
-
+}
+static void gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * stats,
+		IndexBulkDeleteCallback callback, void* callback_state,
+		HTAB* infomap,
+		GistBDSItem* rescanstack, GistBDSItem* tail)
+{
+	GistBDSItem * ptr;
 	while (rescanstack != NULL) {
 		Buffer buffer;
 		Page page;
@@ -583,11 +522,13 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		OffsetNumber todelete[MaxOffsetNumber];
 		int ntodelete = 0;
 		GISTPageOpaque opaque;
-		BlockNumber child;
+		BlockNumber blkno, child;
 		Buffer childBuffer;
 		GistBDSItem *item;
 		bool isNew;
 		bool isDeleted;
+
+		elog(LOG, "get from rescan");
 
 
 		blkno = rescanstack->blkno;
@@ -615,9 +556,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		page = (Page) BufferGetPage(buffer);
 
 		if (GistPageIsLeaf(page)) {
-			// check page to delete
-			// scan page
-
+			/* usual procedure with leafs pages*/
 			LockBuffer(buffer, GIST_UNLOCK);
 			LockBuffer(buffer, GIST_EXCLUSIVE);
 
@@ -667,7 +606,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 				delete = gistGetDeleteLink(infomap, child);
 				/*
-				 * leaf needed to delete????
+				 * leaf is needed to delete????
 				 * */
 				if (delete) {
 					// all data is visible is not held
@@ -771,7 +710,7 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 							}
 						}
 					} else {
-						// child is inner page
+						/* child is inner page */
 
 						PageHeader p = (PageHeader) childpage;
 						todelete[ntodelete] = i - ntodelete;
@@ -780,7 +719,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 
 						GistPageSetDeleted(childpage);
 						stats->pages_deleted++;
-
 					}
 					UnlockReleaseBuffer(childBuffer);
 				}
@@ -828,7 +766,6 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 					/*
 					 * its page is scaned. dont scan it later
 					 * */
-
 					gistMemorizeLinkToDelete(infomap, blkno, true);
 				} else {
 					 GistPageGetOpaque(page)->flags |= F_LEAF;
@@ -843,8 +780,84 @@ gistbulkdelete(PG_FUNCTION_ARGS)
 		rescanstack = ptr;
 
 		vacuum_delay_point();
-
 	}
+}
+
+Datum
+gistbulkdelete(PG_FUNCTION_ARGS)
+{
+	IndexVacuumInfo *info = (IndexVacuumInfo *) PG_GETARG_POINTER(0);
+	IndexBulkDeleteResult *stats = (IndexBulkDeleteResult *) PG_GETARG_POINTER(1);
+	IndexBulkDeleteCallback callback = (IndexBulkDeleteCallback) PG_GETARG_POINTER(2);
+	void	   *callback_state = (void *) PG_GETARG_POINTER(3);
+	Relation	rel = info->index;
+	GistBDSItem *rescanstack = NULL,
+			   *tail = NULL;
+
+	int memoryneeded = 0;
+
+	BlockNumber npages;
+
+	bool needLock;
+	HTAB	   *infomap;
+	HASHCTL		hashCtl;
+
+
+	if (stats == NULL)
+		stats = (IndexBulkDeleteResult *) palloc0(sizeof(IndexBulkDeleteResult));
+	stats->estimated_count = false;
+	stats->num_index_tuples = 0;
+
+	hashCtl.keysize = sizeof(BlockNumber);
+	hashCtl.entrysize = sizeof(GistBlockInfo);
+	hashCtl.hcxt = CurrentMemoryContext;
+
+	needLock = !RELATION_IS_LOCAL(rel);
+
+	if (needLock)
+		LockRelationForExtension(rel, ExclusiveLock);
+	npages = RelationGetNumberOfBlocks(rel);
+	if (needLock)
+		UnlockRelationForExtension(rel, ExclusiveLock);
+
+	/*
+	 * estimate memory limit
+	 * if map more than maintance_mem_work use old version of vacuum
+	 * */
+
+	memoryneeded = npages * (sizeof(GistBlockInfo));
+	if(memoryneeded > maintenance_work_mem * 1024) {
+		return gistbulkdeletelogical(info, stats, callback, callback_state);
+	}
+
+
+	infomap = hash_create("gistvacuum info map",
+										npages,
+										&hashCtl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT );
+
+	rescanstack = (GistBDSItem *) palloc(sizeof(GistBDSItem));
+
+	rescanstack->isParent = false;
+	rescanstack->blkno = GIST_ROOT_BLKNO;
+	rescanstack->next = NULL;
+	tail = rescanstack;
+
+	/*
+	 * this part of the vacuum use scan in physical order. Also this function fill hashmap `infomap`
+	 * that stores information about parent, rightlinks and etc. Pages is needed to rescan will be pushed to tail of rescanstack.
+	 * this function don't set flag gist_deleted.
+	 * */
+	gistphysicalvacuum(rel, info, stats, callback, callback_state, npages, infomap, rescanstack, tail);
+	/*
+	 * this part of the vacuum is not in physical order. It scans only pages from rescanstack.
+	 * we get page if this page is leaf we use usual procedure, but if pages is inner that we scan
+	 * it and delete links to childrens(but firstly recheck children and if all is ok).
+	 * if any pages is empty or new after processing set flag gist_delete , store prune_xid number
+	 * and etc. if all links from pages are deleted push parent of page to rescan stack to processing.
+	 * special case is when all tuples are deleted from index. in this case root block will be setted in leaf.
+	 * */
+	gistrescanvacuum(rel, info, stats, callback, callback_state, infomap, rescanstack, tail);
 
 	hash_destroy(infomap);
 	PG_RETURN_POINTER(stats);
