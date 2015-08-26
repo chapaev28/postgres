@@ -181,7 +181,8 @@ typedef GISTScanOpaqueData *GISTScanOpaque;
 #define XLOG_GIST_PAGE_SPLIT		0x30
  /* #define XLOG_GIST_INSERT_COMPLETE	 0x40 */	/* not used anymore */
 #define XLOG_GIST_CREATE_INDEX		0x50
- /* #define XLOG_GIST_PAGE_DELETE		 0x60 */	/* not used anymore */
+#define XLOG_GIST_PAGE_DELETE		 0x60
+#define XLOG_GIST_RIGHTLINK_CHANGE		 0x70
 
 /*
  * Backup Blk 0: updated page.
@@ -217,6 +218,18 @@ typedef struct gistxlogPageSplit
 	 * follow: 1. gistxlogPage and array of IndexTupleData per page
 	 */
 } gistxlogPageSplit;
+
+typedef struct gistxlogPageDelete
+{
+	TransactionId id;
+} gistxlogPageDelete;
+
+typedef struct gistxlogPageRightlinkChange
+{
+	BlockNumber newRightLink;
+
+} gistxlogPageRightlinkChange;
+
 
 typedef struct gistxlogPage
 {
@@ -454,6 +467,12 @@ extern void gist_desc(StringInfo buf, XLogReaderState *record);
 extern const char *gist_identify(uint8 info);
 extern void gist_xlog_startup(void);
 extern void gist_xlog_cleanup(void);
+
+extern XLogRecPtr gistXLogSetDeleted(RelFileNode node, Buffer buffer,
+					TransactionId xid);
+
+extern XLogRecPtr gistXLogRightLinkChange(RelFileNode node, Buffer buffer,
+					BlockNumber newRightLink) ;
 
 extern XLogRecPtr gistXLogUpdate(RelFileNode node, Buffer buffer,
 			   OffsetNumber *todelete, int ntodelete,
