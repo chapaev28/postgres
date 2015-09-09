@@ -137,17 +137,8 @@ gistRedoPageUpdateRecord(XLogReaderState *record)
 
 			for (i = 0; i < xldata->ntodelete; i++)
 				PageIndexTupleDelete(page, todelete[i]);
-			if(GistPageIsLeaf(page)) {
-				GistMarkTuplesDeleted(page);
-			}
-			/*
-			 * if all links to inner page are deleted from root block
-			 * */
-			/*
-			if(blkno == GIST_ROOT_BLKNO && (max == xldata->ntodelete)) {
-				 GistPageGetOpaque(page)->flags |= F_LEAF;
-			}
-			*/
+
+			GistMarkTuplesDeleted(page);
 		}
 
 		/* add tuples */

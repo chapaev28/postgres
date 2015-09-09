@@ -116,12 +116,21 @@ typedef struct GistBDSItem
 	struct GistBDSItem *next;
 } GistBDSItem;
 
+typedef enum
+{
+	NOT_NEED_TO_PROCESS,	/* without action */
+	PROCESSED,				/* action is done */
+	NEED_TO_PROCESS,
+	NEED_TO_DELETE			/* */
+} GistBlockInfoFlag;
+
 typedef struct GistBlockInfo {
 	BlockNumber blkno;
 	BlockNumber parent;
 	BlockNumber leftblock;		/* block that has rightlink on blkno */
-	bool toDelete;				/* is need delete this block? */
-	bool isDeleted;				/* this block was processed 	*/
+	GistBlockInfoFlag flag;
+	//bool toDelete;				/* is need delete this block? */
+	//bool isDeleted;				/* this block was processed 	*/
 	bool hasRightLink;
 } GistBlockInfo;
 
@@ -158,8 +167,9 @@ gistFillBlockInfo(HTAB * map, BlockNumber blkno)
 		entry->parent = InvalidBlockNumber;
 		entry->leftblock = InvalidBlockNumber;
 		entry->hasRightLink = false;
-		entry->toDelete = false;
-		entry->isDeleted = false;
+		entry->flag = NOT_NEED_TO_PROCESS;
+		//entry->toDelete = false;
+		//entry->isDeleted = false;
 	}
 }
 
@@ -177,8 +187,7 @@ gistMemorizeParentTab(HTAB * map, BlockNumber child, BlockNumber parent)
 		entry->parent = InvalidBlockNumber;
 		entry->leftblock = InvalidBlockNumber;
 		entry->hasRightLink = false;
-		entry->toDelete = false;
-		entry->isDeleted = false;
+		entry->flag = NOT_NEED_TO_PROCESS;
 	}
 	entry->parent = parent;
 }
@@ -199,7 +208,8 @@ gistGetParentTab(HTAB * map, BlockNumber child)
 	return entry->parent;
 }
 
-static BlockNumber gistGetLeftLink(HTAB * map, BlockNumber right)
+static BlockNumber
+gistGetLeftLink(HTAB * map, BlockNumber right)
 {
 	GistBlockInfo *entry;
 	bool		found;
@@ -214,7 +224,8 @@ static BlockNumber gistGetLeftLink(HTAB * map, BlockNumber right)
 	}
 	return entry->leftblock;
 }
-static void gistMemorizeLeftLink(HTAB * map, BlockNumber right, BlockNumber left, bool hasRightLink)
+static void
+gistMemorizeLeftLink(HTAB * map, BlockNumber right, BlockNumber left, bool hasRightLink)
 {
 	GistBlockInfo *entry;
 	bool		found;
@@ -226,8 +237,7 @@ static void gistMemorizeLeftLink(HTAB * map, BlockNumber right, BlockNumber left
 		entry->leftblock = InvalidBlockNumber;
 		entry->parent = InvalidBlockNumber;
 		entry->hasRightLink = false;
-		entry->toDelete = false;
-		entry->isDeleted = false;
+		entry->flag = NOT_NEED_TO_PROCESS;
 	}
 
 	if(hasRightLink) {
@@ -242,8 +252,8 @@ static void gistMemorizeLeftLink(HTAB * map, BlockNumber right, BlockNumber left
 
 }
 
-
-static bool gistGetDeleteLink(HTAB* map, BlockNumber blkno) {
+static bool
+gistGetDeleteLink(HTAB* map, BlockNumber blkno) {
 	GistBlockInfo *entry;
 	bool		found;
 
@@ -256,9 +266,10 @@ static bool gistGetDeleteLink(HTAB* map, BlockNumber blkno) {
 	if (!found)
 		return false;
 
-	return entry->toDelete;
+	return entry->flag == NEED_TO_DELETE;
 }
-static bool gistIsDeletedLink(HTAB* map, BlockNumber blkno) {
+static bool
+gistIsProcessed(HTAB* map, BlockNumber blkno) {
 	GistBlockInfo *entry;
 	bool		found;
 
@@ -268,9 +279,10 @@ static bool gistIsDeletedLink(HTAB* map, BlockNumber blkno) {
 										   HASH_FIND,
 										   &found);
 
-	return entry ? entry->isDeleted: false;
+	return entry ? entry->flag == PROCESSED: false;
 }
-static void gistMemorizeLinkToDelete(HTAB* map, BlockNumber blkno, bool isDeleted) {
+static void
+gistMemorizeLinkToDelete(HTAB* map, BlockNumber blkno, GistBlockInfoFlag flag) {
 	GistBlockInfo *entry;
 	bool		found;
 	entry = (GistBlockInfo *) hash_search(map,
@@ -281,11 +293,9 @@ static void gistMemorizeLinkToDelete(HTAB* map, BlockNumber blkno, bool isDelete
 		entry->parent = InvalidBlockNumber;
 		entry->leftblock = InvalidBlockNumber;
 		entry->hasRightLink = false;
-		entry->toDelete = false;
-		entry->isDeleted = false;
+		entry->flag = NOT_NEED_TO_PROCESS;
 	}
-	entry->toDelete = true;
-	entry->isDeleted = isDeleted;
+	entry->flag = flag;
 }
 
 /*
@@ -680,7 +690,7 @@ gistphysicalvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult *
 				tail = item;
 
 
-				gistMemorizeLinkToDelete(infomap, blkno, false);
+				gistMemorizeLinkToDelete(infomap, blkno, NEED_TO_DELETE);
 			} else {
 				START_CRIT_SECTION();
 
@@ -728,15 +738,15 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 		Buffer childBuffer;
 		GistBDSItem *item;
 		bool isNew;
-		bool isDeleted;
+		bool isProcessed;
 
 		BlockNumber setdeletedblkno[MaxOffsetNumber];
 
 		blkno = rescanstack->blkno;
 		if (gistGetParentTab(infomap, blkno) == InvalidBlockNumber && blkno != GIST_ROOT_BLKNO) {
 			/*
-			 * strange pages. it's maybe(pages without parent but not root).
-			 * for example when last vacuum shut down and we can set this page as deleted
+			 * strange pages. it's maybe(pages without parent but is not root).
+			 * for example when last vacuum shut down and we can delete link to this page but dont set deleted
 			 * repair that pages.
 			 * how repaire: remove data if exists. rightlink repair. set-deleted
 			 */
@@ -753,9 +763,9 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 			blkno = gistGetParentTab(infomap, blkno);
 		}
 
-		isDeleted = gistIsDeletedLink(infomap, blkno);
+		isProcessed = gistIsProcessed(infomap, blkno);
 
-		if(isDeleted == true || blkno == InvalidBlockNumber) {
+		if(isProcessed == true || blkno == InvalidBlockNumber) {
 
 			ptr = rescanstack->next;
 			pfree(rescanstack);
@@ -870,18 +880,14 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 							END_CRIT_SECTION();
 
 							if ((ntodeletechild == maxoffchild) || childIsNew) {
-
 								/*
 								 *
 								 * if there is right link on this page but not rightlink from this page. remove rightlink from left page.
 								 * if there is right link on this page and there is a right link . right link of left page must be rightlink to rightlink of this page.
 								 * */
-
-								gistMemorizeLinkToDelete(infomap, child, true);
 								todelete[ntodelete] = i - ntodelete;
 								setdeletedblkno[ntodelete] = child;
 								ntodelete++;
-
 							}
 						}
 					}
@@ -899,7 +905,6 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 				item->next = rescanstack->next;
 				rescanstack->next = item;
 			} else {
-				// could not remove symbolic link
 				/*
 				 * delete links to pages
 				 * */
@@ -933,6 +938,8 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 					Buffer childBuffertodelete;
 					Page childpagetodelete;
 					PageHeader p;
+					gistMemorizeLinkToDelete(infomap, setdeletedblkno[i], PROCESSED);
+
 					childBuffertodelete = ReadBufferExtended(rel, MAIN_FORKNUM, setdeletedblkno[i],
 							RBM_NORMAL, info->strategy);
 
@@ -953,7 +960,7 @@ gistrescanvacuum(Relation rel, IndexVacuumInfo * info, IndexBulkDeleteResult * s
 				}
 			}
 		}
-
+		gistMemorizeLinkToDelete(infomap, blkno, PROCESSED);
 		UnlockReleaseBuffer(buffer);
 
 		ptr = rescanstack->next;
